@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding"
 	"encoding/binary"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"net"
@@ -55,6 +56,8 @@ type Client struct {
 	ip    string
 	port  int
 	laddr *net.UDPAddr
+	conn  	*net.UDPConn
+ 	reply	bool
 }
 
 // Server represents an OSC server. The server listens on Address and Port for
@@ -473,8 +476,8 @@ func (b *Bundle) MarshalBinary() ([]byte, error) {
 // messages and OSC bundles over an UDP network connection. The `ip` argument
 // specifies the IP address and `port` defines the target port where the
 // messages and bundles will be send to.
-func NewClient(ip string, port int) *Client {
-	return &Client{ip: ip, port: port, laddr: nil}
+func NewClient(ip string, port int, reply bool) *Client {
+	return &Client{ip: ip, port: port, laddr: nil, reply: reply}
 }
 
 // IP returns the IP address.
@@ -501,15 +504,28 @@ func (c *Client) SetLocalAddr(ip string, port int) error {
 
 // Send sends an OSC Bundle or an OSC Message.
 func (c *Client) Send(packet Packet) error {
+	var conn net.Conn
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", c.ip, c.port))
 	if err != nil {
 		return err
 	}
-	conn, err := net.DialUDP("udp", c.laddr, addr)
-	if err != nil {
-		return err
+	if c.reply == false {
+		conn1, err := net.DialUDP("udp", c.laddr, addr)
+		if err != nil {
+			return err
+		}
+		conn = conn1
+		defer conn.Close()
+	} else {
+		if c.conn == nil {
+			conn1, err := net.DialUDP("udp", c.laddr, addr)
+			if err != nil {
+				return err
+			}
+			c.conn = conn1
+		}
+		conn = c.conn
 	}
-	defer conn.Close()
 
 	data, err := packet.MarshalBinary()
 	if err != nil {
@@ -520,6 +536,20 @@ func (c *Client) Send(packet Packet) error {
 		return err
 	}
 	return nil
+}
+
+func (c *Client) RX() ( Packet ,error) {
+	if c.conn != nil {
+		server := &Server{ ReadTimeout: 5 * time.Millisecond }
+		packet, err := server.ReceivePacket(c.conn)
+		if err != nil {
+			return nil, err
+		}
+		if packet != nil {
+			return packet,nil
+		}
+	}
+	return nil,nil
 }
 
 ////
@@ -584,7 +614,10 @@ func (s *Server) readFromConnection(c net.PacketConn) (Packet, error) {
 	data := make([]byte, 65535)
 	n, _, err := c.ReadFrom(data)
 	if err != nil {
-		return nil, err
+		nerr, _ := err.(net.Error)
+		if !nerr.Timeout() {
+			return nil, err
+		}
 	}
 
 	var start int
@@ -623,6 +656,14 @@ func readPacket(reader *bufio.Reader, start *int, end int) (Packet, error) {
 	}
 	if buf[0] == '#' { // An OSC bundle starts with a '#'
 		packet, err := readBundle(reader, start, end)
+		if err != nil {
+			return nil, err
+		}
+		return packet, nil
+	}
+
+	if buf[0] == 'n' { // X32 node reply.
+		packet, err := readX32Node(reader, start)
 		if err != nil {
 			return nil, err
 		}
@@ -693,6 +734,39 @@ func readMessage(reader *bufio.Reader, start *int) (*Message, error) {
 	}
 
 	return msg, nil
+}
+
+func readX32Node(reader *bufio.Reader, start *int) (*Message, error) {
+	// First, read the OSC address
+	node, n, err := readPaddedString(reader)
+	if err != nil {
+		return nil, err
+	}
+	*start += n
+
+	// Read all arguments
+	m1 := NewMessage(node)
+	if err = readArguments(m1, reader, start); err != nil {
+		return nil, err
+	}
+
+	r := csv.NewReader(strings.NewReader(m1.Arguments[0].(string)))
+	r.Comma = ' ' // space
+	fields, err := r.Read()
+	if err != nil {
+		return nil, err
+	}
+	msg := NewMessage(fields[0])
+	for i, field := range fields {
+		if i != 0 {
+			msg.Append(field)
+		}
+	}
+	return msg, nil
+}
+
+func MessageToString(msg *Message) string {
+	return fmt.Sprintf("%#V",msg)
 }
 
 // readArguments from `reader` and add them to the OSC message `msg`.
